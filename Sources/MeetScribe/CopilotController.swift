@@ -49,6 +49,33 @@ final class CopilotController {
     /// この不変条件は `CopilotControllerTests` で固定している。
     static let overviewContextChars = 8_000
 
+    // MARK: - Catchup の入力上限とタイムアウト
+
+    /// Catchup で LLM へ渡す転写の上限文字数 (超過分は**末尾を残して**捨てる)。
+    ///
+    /// Catchup にはこれまで入力クリップが無く、`entriesInWindow` の結果を丸ごと送っていた。
+    /// 固定ボタンが最大10分 (= 約5,700字) だったので実害が出ていなかっただけで、
+    /// 任意入力で30分を指定できるようにすると素で約17,000字が飛ぶ。
+    ///
+    /// 値の根拠: 上限30分 × 発話速度の実測中央値 571字/分 = 約17,130字が**クリップされずに
+    /// 通る**必要がある (ユーザーが明示的に指定した範囲を黙って削るのは Catchup の意図に反する)。
+    /// その上で早口・多人数で中央値の1.4倍まで振れても素通しできる 24,000字を上限にする。
+    /// ここで $0.010/回 (1コマ約$0.25の4%) なので、コスト側の制約にはならない。
+    /// Overview の 8,000字より広いのは、あちらが「自動で何度も走る」のに対し
+    /// Catchup は「押した時だけ・範囲をユーザーが決める」ものだから。
+    /// この下限側の不変条件は `CopilotControllerTests` で固定している。
+    static let catchupContextChars = 24_000
+
+    /// Catchup 1回のタイムアウト (秒)。
+    ///
+    /// 20秒から引き上げた。理由は `TranscriptCleaner.batchTimeoutSeconds` を 20→40 にした時と
+    /// 同じ (2026-08-14 の実測でクリーナー85件中1件が20秒で落ち、そのバッチが丸ごと失われた):
+    /// 応答は通常数秒で返るが、20秒はネットワークの一時的な詰まりを吸収しきれない。
+    /// 入力が最大24,000字まで伸びると prefill も乗るので余裕がさらに要る。
+    /// Catchup が落ちると「要約の生成に失敗しました」カードが残り、押し直す手間になる
+    /// (= 離席から戻って追いつきたい場面で最も避けたい)。cleaner と同じ40秒に揃える。
+    static let catchupTimeoutSeconds: TimeInterval = 40
+
     private var monitorTask: Task<Void, Never>?
     /// 実行中の Catchup。セッション終了/再開時に cancel し、旧セッションの
     /// 遅延応答が新セッションのカードリストや実行中フラグを汚さないようにする。
@@ -143,13 +170,20 @@ final class CopilotController {
 
         AppState.shared.isCatchupRunning = true
 
-        let transcript = Self.transcriptText(windowEntries)
+        let fullTranscript = Self.transcriptText(windowEntries)
+        let transcript = Self.clipForCatchup(fullTranscript, limit: Self.catchupContextChars)
+        if transcript.count < fullTranscript.count {
+            // **発話本文は出さない。** 字数だけ残す (ログは平文で長期間残るため)。
+            DebugLog.log(
+                "[copilot] catchup input clipped: \(fullTranscript.count) → \(transcript.count) chars (window \(minutes)m)"
+            )
+        }
         let (text, costUSD) = await OpenAIChatClient.complete(
             system: Self.catchupSystemPrompt,
             user: transcript,
             apiKey: apiKey,
             provider: provider,
-            timeout: 20,
+            timeout: Self.catchupTimeoutSeconds,
             cacheKey: PromptCacheKey.catchup,
             usageLabel: "catchup"
         )
@@ -288,6 +322,15 @@ final class CopilotController {
     /// LLM に渡す転写テキスト (話者ラベル付き)。
     static func transcriptText(_ entries: [TranscriptEntry]) -> String {
         entries.map { "[\($0.speaker.displayName)] \($0.text)" }.joined(separator: "\n")
+    }
+
+    /// Catchup の入力を上限文字数までクリップする。**残すのは末尾 (直近側)。**
+    ///
+    /// Catchup は「直近N分に追いつく」機能なので、削るなら古い側から削るのが意図に沿う
+    /// (Overview の末尾クリップと同じ考え方)。上限以下なら何も触らない。
+    static func clipForCatchup(_ transcript: String, limit: Int) -> String {
+        guard transcript.count > limit else { return transcript }
+        return String(transcript.suffix(limit))
     }
 }
 

@@ -5,12 +5,26 @@ import AppKit
 /// (旧 ScribeQAView のタイプ入力式 Q&A を置き換え)
 /// - 上部: 全体像パネル (目的/議題/現在地、自動更新)
 /// - 中央: Catchup要約カード (新しい順)
-/// - 下部: Catchupボタン (1/3/5/10分)
+/// - 下部: Catchupボタン (3/5/10分) + 任意の分数の入力欄
 struct CopilotPanelView: View {
     let state: AppState
 
-    /// Catchup ボタンの分数
-    private static let catchupMinutes = [1, 3, 5, 10]
+    /// Catchup ボタンの分数。
+    ///
+    /// 1分は削除した (短すぎて使われていない — 1分ぶんの発話は約570字で、
+    /// 「一文サマリ + 箇条書き3〜6点」に要約する意味がほとんど無い)。
+    /// 任意入力では1分も受け付けるので、機能が失われるわけではない
+    /// (`CatchupWindowInput.minMinutes`)。
+    /// テストで固定するため internal。
+    static let catchupMinutes = [3, 5, 10]
+
+    /// 任意の分数の入力。
+    ///
+    /// **実行後もクリアしない。** 同じ分数を続けて使う場面 (長い離席で10分→10分、
+    /// 授業で15分→15分) が普通なので毎回打ち直すのは手間だし、値が残っていても
+    /// 実行には Enter か「要約」ボタンの明示操作が必要なので勝手に走ることはない。
+    /// 残った値がそのまま「次に実行される分数」として見えているぶん、誤爆はむしろ気づきやすい。
+    @State private var customMinutesText = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -152,7 +166,7 @@ struct CopilotPanelView: View {
 
     private var placeholder: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("⏱ 下のボタンで直近の内容に追いつけます")
+            Text("⏱ 下のボタン・分数入力で直近の内容に追いつけます")
                 .font(.scaled(11))
                 .foregroundStyle(.secondary)
             Text("離席から戻った時・聞き逃した時に、その間の要約を数秒で表示します")
@@ -189,7 +203,24 @@ struct CopilotPanelView: View {
 
     // MARK: - Catchup ボタン行
 
+    /// 固定ボタン行 + 任意分数の入力行。
+    ///
+    /// **2行に分けている理由は幅。** 右カラムは HSplitView のドラッグで `minWidth: 200` まで
+    /// 縮められ、さらに ⌘+ (`uiScale`) で文字が拡大する。1行に「アイコン + ボタン3個 +
+    /// 入力欄 + 実行ボタン」を並べると縮めた時に確実にはみ出す
+    /// (1分を削って空いた幅ぶんでは足りない)。小窓では幅のほうが貴重なので、
+    /// 縦に1行 (約20pt) 増やすほうを選ぶ。
     private var catchupButtonBar: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            catchupPresetRow
+            customCatchupRow
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    /// 固定分数のボタン行。末尾の `Spacer()` が左詰めを作っているので消さないこと。
+    private var catchupPresetRow: some View {
         HStack(spacing: 6) {
             Image(systemName: "clock.arrow.circlepath")
                 .font(.scaled(11))
@@ -203,8 +234,91 @@ struct CopilotPanelView: View {
             }
             Spacer()
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+    }
+
+    /// 任意の分数 (1〜30) を入力して実行する行。Enter でも「要約」ボタンでも走る。
+    private var customCatchupRow: some View {
+        let validation = CatchupWindowInput.validate(customMinutesText)
+        let minutes = try? validation.get()
+        // 固定ボタンと同じ条件: 録音中かつ Catchup 実行中でないときだけ使える
+        let usable = state.isRunning && !state.isCatchupRunning
+        let enabled = usable && minutes != nil
+        let helpText = customRowHelp(validation: validation, usable: usable)
+        let showsInvalidInput = !customMinutesText
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && minutes == nil
+
+        return HStack(spacing: 4) {
+            TextField(
+                "\(CatchupWindowInput.minMinutes)-\(CatchupWindowInput.maxMinutes)",
+                text: $customMinutesText
+            )
+            .textFieldStyle(.roundedBorder)
+            .font(.scaled(10))
+            .multilineTextAlignment(.trailing)
+            .frame(width: 40)
+            // 入力欄自体は常に編集可能にしておく。**実行**だけを `usable` で止める
+            // (下の Button と `runCustomCatchup` の guard)。
+            // 入力中に Catchup が走り始めた瞬間に欄が disabled になると、
+            // 打ちかけの数字とフォーカスが飛んで打ち直しになる。
+            .onSubmit { runCustomCatchup() }
+            // 無効な入力は枠を赤くする (このアプリの赤 = エラー: 失敗カードと同じ語彙)。
+            // 何が悪いのかは help に文言で出す。
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(Color.red.opacity(0.55), lineWidth: 1)
+                    .opacity(showsInvalidInput ? 1 : 0)
+            )
+            .help(helpText)
+            .accessibilityLabel("Catchup の分数")
+            Text("分")
+                .font(.scaled(9))
+                .foregroundStyle(.secondary)
+            Button { runCustomCatchup() } label: {
+                Text("要約")
+                    .font(.scaled(10))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(enabled ? Color.orange.opacity(0.18) : Color.secondary.opacity(0.08))
+                    )
+            }
+            .buttonStyle(.plain)
+            .disabled(!enabled)
+            .help(helpText)
+            Spacer()
+        }
+    }
+
+    /// 入力欄・実行ボタンのツールチップ。**無効なときは理由が分かるようにする。**
+    /// 入力の問題 (範囲外・非整数) を状態の問題 (録音していない) より優先して出す
+    /// = ユーザーが直せることを先に見せる。
+    private func customRowHelp(
+        validation: Result<Int, CatchupWindowInput.Rejection>,
+        usable: Bool
+    ) -> String {
+        switch validation {
+        case .failure(let rejection):
+            // 空欄は「エラー」ではないので、使えない状態ならそちらを案内する
+            if rejection == .empty, !usable { return unusableReason }
+            return rejection.message
+        case .success(let minutes):
+            if !usable { return unusableReason }
+            return "直近\(minutes)分を日本語で要約"
+        }
+    }
+
+    private var unusableReason: String {
+        state.isRunning ? "要約を生成中です" : "録音中のみ使えます"
+    }
+
+    /// 入力欄からの実行。`onSubmit` はボタンが disabled でも飛んでくるので、
+    /// ここでも状態と入力の両方を確認する
+    /// (判定の出典は `CatchupWindowInput.validate` の一箇所だけに保つ)。
+    private func runCustomCatchup() {
+        guard state.isRunning, !state.isCatchupRunning else { return }
+        guard case .success(let minutes) = CatchupWindowInput.validate(customMinutesText) else { return }
+        CopilotController.shared.requestCatchup(minutes: minutes)
     }
 
     private func catchupButton(minutes: Int) -> some View {
